@@ -8,6 +8,9 @@ import tempfile
 import traceback
 import tomllib
 import tomli_w
+import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 import glob
@@ -24,9 +27,93 @@ else:
 
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+MAIN_SERVER_PORT = 13337
+
+# Registry of connected IDA instances
+# Key: sha256 hash, Value: instance metadata
+IDA_INSTANCES: dict[str, dict] = {}
+_instances_lock = threading.Lock()
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
+
+
+def find_instance(binary: str) -> dict | None:
+    """Find an IDA instance by binary identifier (sha256, module name, or path)"""
+    with _instances_lock:
+        # 1. Try sha256 hash first
+        if binary in IDA_INSTANCES:
+            return IDA_INSTANCES[binary]
+
+        # 2. Try module name
+        for instance in IDA_INSTANCES.values():
+            if instance.get("module") == binary:
+                return instance
+
+        # 3. Try path partial match
+        for instance in IDA_INSTANCES.values():
+            if binary in instance.get("path", ""):
+                return instance
+
+        return None
+
+
+def get_instance_count() -> int:
+    """Get the number of registered instances"""
+    with _instances_lock:
+        return len(IDA_INSTANCES)
+
+
+def get_single_instance() -> dict | None:
+    """Get the single registered instance (if exactly one)"""
+    with _instances_lock:
+        if len(IDA_INSTANCES) == 1:
+            return list(IDA_INSTANCES.values())[0]
+        return None
+
+
+def forward_to_instance(request_data: bytes, host: str, port: int) -> dict:
+    """Forward a request to an IDA instance"""
+    conn = http.client.HTTPConnection(host, port, timeout=30)
+    try:
+        conn.request("POST", "/mcp", request_data, {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        data = response.read().decode()
+        return json.loads(data)
+    finally:
+        conn.close()
+
+
+def add_binary_param_to_schema(response: dict) -> dict:
+    """Add 'binary' parameter to all tool schemas and add list_instances tool"""
+    if "result" not in response or "tools" not in response["result"]:
+        return response
+
+    # Add binary parameter to all tools from IDA
+    for tool in response["result"]["tools"]:
+        if "inputSchema" in tool and "properties" in tool["inputSchema"]:
+            tool["inputSchema"]["properties"]["binary"] = {
+                "type": "string",
+                "description": "Target binary (name like 'binary.exe', sha256 hash, or path). Use list_instances to see available binaries.",
+            }
+
+    # Add list_instances tool (main server tool)
+    list_instances_tool = {
+        "name": "list_instances",
+        "description": "List all connected IDA Pro instances with their binary information",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    }
+
+    # Check if list_instances already exists
+    existing_names = {tool["name"] for tool in response["result"]["tools"]}
+    if "list_instances" not in existing_names:
+        response["result"]["tools"].append(list_instances_tool)
+
+    return response
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -36,47 +123,170 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     else:
         request_obj: JsonRpcRequest = request  # type: ignore
 
-    if request_obj["method"] == "initialize":
+    method = request_obj["method"]
+
+    # Handle locally: initialize, notifications
+    if method == "initialize":
         return dispatch_original(request)
-    elif request_obj["method"].startswith("notifications/"):
+    elif method.startswith("notifications/"):
         return dispatch_original(request)
 
-    conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
+    # Handle list_instances locally (it's a main server tool)
+    if method == "tools/call":
+        params = request_obj.get("params", {})
+        if isinstance(params, dict) and params.get("name") == "list_instances":
+            return dispatch_original(request)
+
+    # Handle tools/list - try to discover instances if none registered
+    if method == "tools/list":
+        if get_instance_count() == 0:
+            discover_ida_instances(IDA_HOST)
+
+        if get_instance_count() == 0:
+            # Still no instances - return only list_instances tool
+            request_id = request_obj.get("id")
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "tools": [
+                        {
+                            "name": "list_instances",
+                            "description": "List all connected IDA Pro instances with their binary information. No IDA instances are currently connected.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {},
+                                "required": [],
+                            },
+                        }
+                    ]
+                },
+                "id": request_id,
+            }
+
+        # Get tools from the first available instance (all instances have same tools)
+        with _instances_lock:
+            first_instance = list(IDA_INSTANCES.values())[0]
+        try:
+            request_data = json.dumps(request_obj).encode("utf-8")
+            response = forward_to_instance(request_data, first_instance["host"], first_instance["port"])
+            return add_binary_param_to_schema(response)
+        except Exception as e:
+            request_id = request_obj.get("id")
+            return {
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": f"Failed to get tools: {e}"},
+                "id": request_id,
+            }
+
+    # Extract binary parameter for routing
+    # For tools/call, binary is in params.arguments
+    # For other methods, binary might be directly in params
+    params = request_obj.get("params", {})
+    binary = None
+    if isinstance(params, dict):
+        if method == "tools/call" and "arguments" in params:
+            arguments = params.get("arguments", {})
+            if isinstance(arguments, dict):
+                binary = arguments.pop("binary", None)
+        else:
+            binary = params.pop("binary", None)
+
+    # Determine target instance
+    target_host = IDA_HOST
+    target_port = IDA_PORT
+    instance = None
+
+    if binary:
+        instance = find_instance(binary)
+        if not instance:
+            request_id = request_obj.get("id")
+            if request_id is None:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32000,
+                    "message": f"No IDA instance found for binary: {binary}. Use list_instances to see available binaries.",
+                },
+                "id": request_id,
+            }
+        target_host = instance["host"]
+        target_port = instance["port"]
+    elif get_instance_count() == 1:
+        # Single instance - auto-route
+        instance = get_single_instance()
+        if instance:
+            target_host = instance["host"]
+            target_port = instance["port"]
+    elif get_instance_count() > 1:
+        # Multiple instances - require binary parameter
+        request_id = request_obj.get("id")
+        if request_id is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": "Multiple IDA instances are connected. Please specify the 'binary' parameter to select which one to use. Use list_instances to see available binaries.",
+            },
+            "id": request_id,
+        }
+    # If no instances registered, try default port (backward compatibility)
+
     try:
-        if isinstance(request, dict):
-            request = json.dumps(request)
-        elif isinstance(request, str):
-            request = request.encode("utf-8")
-        conn.request("POST", "/mcp", request, {"Content-Type": "application/json"})
-        response = conn.getresponse()
-        data = response.read().decode()
-        return json.loads(data)
+        # Re-serialize request (binary param removed)
+        request_data = json.dumps(request_obj).encode("utf-8")
+        response = forward_to_instance(request_data, target_host, target_port)
+
+        # Inject binary param into tools/list response
+        if method == "tools/list":
+            response = add_binary_param_to_schema(response)
+
+        return response
     except Exception as e:
         full_info = traceback.format_exc()
-        id = request_obj.get("id")
-        if id is None:
-            return None  # Notification, no response needed
+        request_id = request_obj.get("id")
+        if request_id is None:
+            return None
 
         if sys.platform == "darwin":
             shortcut = "Ctrl+Option+M"
         else:
             shortcut = "Ctrl+Alt+M"
-        return JsonRpcResponse(
-            {
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}",
-                    "data": str(e),
-                },
-                "id": id,
-            }
-        )
-    finally:
-        conn.close()
+        return {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}",
+                "data": str(e),
+            },
+            "id": request_id,
+        }
 
 
 mcp.registry.dispatch = dispatch_proxy
+
+
+# MCP tool: list_instances
+@mcp.tool
+def list_instances() -> list[dict]:
+    """List all connected IDA Pro instances with their binary information"""
+    # Always try to discover new instances
+    discover_ida_instances(IDA_HOST)
+
+    with _instances_lock:
+        return [
+            {
+                "binary_id": binary_id,
+                "module": info.get("module", ""),
+                "path": info.get("path", ""),
+                "md5": info.get("md5", ""),
+                "sha256": info.get("sha256", ""),
+                "port": info.get("port", 0),
+                "registered_at": info.get("registered_at", 0),
+            }
+            for binary_id, info in IDA_INSTANCES.items()
+        ]
 
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -817,6 +1027,165 @@ def install_ida_plugin(
                 print("Skipping IDA plugin installation (already up to date)")
 
 
+def register_instance(data: dict) -> dict:
+    """Register an IDA instance"""
+    sha256 = data.get("sha256", "")
+    md5 = data.get("md5", "")
+    binary_id = sha256 if sha256 else md5
+
+    if not binary_id:
+        return {"success": False, "error": "No sha256 or md5 provided"}
+
+    with _instances_lock:
+        IDA_INSTANCES[binary_id] = {
+            "host": data.get("host", "127.0.0.1"),
+            "port": data.get("port", 13337),
+            "path": data.get("path", ""),
+            "module": data.get("module", ""),
+            "md5": md5,
+            "sha256": sha256,
+            "registered_at": time.time(),
+        }
+
+    return {"success": True, "binary_id": binary_id}
+
+
+def unregister_instance(data: dict) -> dict:
+    """Unregister an IDA instance"""
+    binary_id = data.get("binary_id", "")
+    sha256 = data.get("sha256", "")
+    md5 = data.get("md5", "")
+
+    # Try to find by binary_id, sha256, or md5
+    key_to_remove = None
+    with _instances_lock:
+        if binary_id and binary_id in IDA_INSTANCES:
+            key_to_remove = binary_id
+        elif sha256 and sha256 in IDA_INSTANCES:
+            key_to_remove = sha256
+        elif md5 and md5 in IDA_INSTANCES:
+            key_to_remove = md5
+
+        if key_to_remove:
+            del IDA_INSTANCES[key_to_remove]
+            return {"success": True, "binary_id": key_to_remove}
+
+    return {"success": False, "error": "Instance not found"}
+
+
+class RegistryHttpHandler(BaseHTTPRequestHandler):
+    """HTTP handler for instance registration endpoints"""
+
+    def log_message(self, format, *args):
+        pass  # Suppress logging
+
+    def do_POST(self):
+        if self.path == "/register":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode("utf-8")
+            try:
+                data = json.loads(body)
+                result = register_instance(data)
+                self._send_json(result)
+            except json.JSONDecodeError:
+                self._send_json({"success": False, "error": "Invalid JSON"}, 400)
+        elif self.path == "/unregister":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode("utf-8")
+            try:
+                data = json.loads(body)
+                result = unregister_instance(data)
+                self._send_json(result)
+            except json.JSONDecodeError:
+                self._send_json({"success": False, "error": "Invalid JSON"}, 400)
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def do_GET(self):
+        if self.path == "/instances":
+            with _instances_lock:
+                instances = [
+                    {
+                        "binary_id": binary_id,
+                        "module": info.get("module", ""),
+                        "path": info.get("path", ""),
+                        "port": info.get("port", 0),
+                    }
+                    for binary_id, info in IDA_INSTANCES.items()
+                ]
+            self._send_json({"instances": instances})
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def _send_json(self, data: dict, status: int = 200):
+        response = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+
+def start_registry_server(host: str = "127.0.0.1", port: int = MAIN_SERVER_PORT):
+    """Start the registry HTTP server in a background thread"""
+    server = HTTPServer((host, port), RegistryHttpHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def discover_ida_instances(
+    host: str = "127.0.0.1", start_port: int = 13338, max_tries: int = 10
+):
+    """Discover running IDA instances by scanning ports and querying idb_meta"""
+    discovered = 0
+    for i in range(max_tries):
+        port = start_port + i
+        try:
+            # Try to call idb_meta on this port
+            conn = http.client.HTTPConnection(host, port, timeout=2)
+            request = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "idb_meta", "arguments": {}},
+                "id": 1,
+            }
+            conn.request(
+                "POST", "/mcp", json.dumps(request), {"Content-Type": "application/json"}
+            )
+            response = conn.getresponse()
+            data = json.loads(response.read().decode())
+            conn.close()
+
+            # Check if we got valid metadata
+            if "result" in data and "content" in data["result"]:
+                content = data["result"]["content"]
+                if content and len(content) > 0 and "text" in content[0]:
+                    metadata = json.loads(content[0]["text"])
+                    # Register this instance
+                    register_data = {
+                        "host": host,
+                        "port": port,
+                        "path": metadata.get("path", ""),
+                        "module": metadata.get("module", ""),
+                        "md5": metadata.get("md5", ""),
+                        "sha256": metadata.get("sha256", ""),
+                    }
+                    result = register_instance(register_data)
+                    if result.get("success"):
+                        discovered += 1
+                        # Note: Don't print to stdout in stdio mode - it breaks the protocol
+                        print(
+                            f"[MCP] Discovered IDA instance: {metadata.get('module', 'unknown')} on port {port}",
+                            file=sys.stderr
+                        )
+        except Exception:
+            # Port not responding or not an IDA instance
+            pass
+
+    return discovered
+
+
 def main():
     global IDA_HOST, IDA_PORT
     parser = argparse.ArgumentParser(description="IDA Pro MCP Server")
@@ -875,6 +1244,18 @@ def main():
         print_mcp_config()
         return
 
+    # Start the registry HTTP server in background for IDA instances to register
+    registry_server = None
+    try:
+        registry_server = start_registry_server(IDA_HOST, MAIN_SERVER_PORT)
+    except OSError as e:
+        # Port already in use - another main server is running, that's fine
+        if e.errno not in (48, 98, 10048):
+            raise
+
+    # Discover already running IDA instances
+    discover_ida_instances(IDA_HOST)
+
     try:
         if args.transport == "stdio":
             mcp.stdio()
@@ -887,6 +1268,9 @@ def main():
             input("Server is running, press Enter or Ctrl+C to stop.")
     except (KeyboardInterrupt, EOFError):
         pass
+    finally:
+        if registry_server:
+            registry_server.shutdown()
 
 
 if __name__ == "__main__":
